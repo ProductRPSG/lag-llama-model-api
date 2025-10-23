@@ -1,3 +1,8 @@
+# Core API framework
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# Lag-Llama ML dependencies  
 gluonts[torch]<=0.14.4
 numpy>=1.23.5
 torch>=2.0.0
@@ -6,3 +11,6 @@ scipy
 pandas
 huggingface_hub[cli]
 matplotlib
+
+# Production server
+gunicorn>=21.0.0
