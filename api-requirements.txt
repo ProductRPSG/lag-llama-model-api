@@ -1,0 +1,19 @@
+# Lag-Llama API Dependencies
+# Core API framework
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# Existing Lag-Llama dependencies  
+gluonts[torch]<=0.14.4
+numpy>=1.23.5
+torch>=2.0.0
+scipy
+pandas
+matplotlib
+
+# HuggingFace for model downloading
+huggingface_hub[cli]
+
+# Optional but recommended for production
+gunicorn>=21.0.0  # Production WSGI server
+python-dotenv>=1.0.0  # Environment variable management
