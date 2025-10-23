@@ -224,7 +224,7 @@ def predict():
                 }), 400
         else:
             # Generate timestamps based on frequency
-            start_timestamp = pd.Timestamp("2023-01-01 00:00:00")
+            start_timestamp = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
         
         log_message(f"Using frequency: {frequency}, start: {start_timestamp}")
         
