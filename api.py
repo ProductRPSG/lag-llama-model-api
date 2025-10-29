@@ -31,19 +31,20 @@ CORS(app)  # Enable CORS for JavaScript requests
 # Global variables
 model = None
 predictor = None
+estimator = None  # Store estimator to create prediction-length-specific predictors
 
 def log_message(message):
     """Simple logging function"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
 
-def load_model():
-    """Load the pre-trained Lag-Llama model from HuggingFace"""
-    global model, predictor
+def load_estimator():
+    """Load the pre-trained Lag-Llama estimator from HuggingFace"""
+    global estimator
     
-    if predictor is not None:
-        log_message("Model already loaded")
-        return predictor
+    if estimator is not None:
+        log_message("Estimator already loaded")
+        return estimator
     
     try:
         log_message("Starting model download from HuggingFace...")
@@ -66,9 +67,10 @@ def load_model():
         torch.load = safe_load
         
         # Create estimator with exact configuration from lag_llama.json
+        # We'll create prediction-length-specific predictors as needed
         estimator = LagLlamaEstimator(
             ckpt_path=ckpt_path,
-            prediction_length=24,  # Default, will be updated per request
+            prediction_length=24,  # Base configuration - will create specific predictors per request
             context_length=32,     # From config
             input_size=1,
             n_layer=8,           # From config: 8 layers
@@ -81,22 +83,68 @@ def load_model():
             trainer_kwargs={}
         )
         
-        log_message("Creating predictor...")
+        # Restore original torch.load
+        torch.load = original_load
         
-        # Create the predictor
-        predictor = estimator.create_predictor(
-            estimator.create_transformation(),
-            estimator.create_lightning_module()
+        log_message("✅ Estimator loaded successfully!")
+        return estimator
+        
+    except Exception as e:
+        log_message(f"❌ Error loading model: {str(e)}")
+        log_message(traceback.format_exc())
+        return None
+
+def create_predictor_for_length(prediction_length: int):
+    """Create a predictor with the specified prediction length"""
+    global estimator
+    
+    if estimator is None:
+        estimator = load_estimator()
+        if estimator is None:
+            return None
+    
+    try:
+        log_message(f"Creating predictor for prediction_length={prediction_length}")
+        
+        # Fix PyTorch loading
+        original_load = torch.load
+        def safe_load(*args, **kwargs):
+            kwargs['weights_only'] = False
+            return original_load(*args, **kwargs)
+        torch.load = safe_load
+        
+        # Create a new estimator with the correct prediction length
+        # We need to recreate the estimator with the right prediction_length
+        # since the model architecture depends on it
+        temp_estimator = LagLlamaEstimator(
+            ckpt_path=estimator.ckpt_path,
+            prediction_length=prediction_length,  # Correct prediction length
+            context_length=estimator.context_length,
+            input_size=estimator.input_size,
+            n_layer=estimator.n_layer,
+            n_embd_per_head=estimator.n_embd_per_head,
+            n_head=estimator.n_head,
+            scaling=estimator.scaling,
+            rope_scaling=estimator.rope_scaling,
+            batch_size=estimator.batch_size,
+            time_feat=estimator.time_feat,
+            trainer_kwargs=estimator.trainer_kwargs
+        )
+        
+        # Create predictor
+        predictor = temp_estimator.create_predictor(
+            temp_estimator.create_transformation(),
+            temp_estimator.create_lightning_module()
         )
         
         # Restore original torch.load
         torch.load = original_load
         
-        log_message("✅ Model loaded successfully!")
+        log_message(f"✅ Predictor created for prediction_length={prediction_length}")
         return predictor
         
     except Exception as e:
-        log_message(f"❌ Error loading model: {str(e)}")
+        log_message(f"❌ Error creating predictor: {str(e)}")
         log_message(traceback.format_exc())
         return None
 
@@ -150,7 +198,7 @@ def validate_input_data(data):
 def health_check():
     """Health check endpoint"""
     try:
-        model_status = "loaded" if predictor is not None else "not_loaded"
+        model_status = "loaded" if estimator is not None else "not_loaded"
         return jsonify({
             "status": "healthy", 
             "message": "Lag-Llama API is running",
@@ -201,10 +249,15 @@ def predict():
         
         log_message(f"Processing series with {len(time_series)} points, predicting {prediction_length} steps")
         
-        # Load model if not already loaded
-        current_predictor = load_model()
+        # Load estimator if not already loaded and create predictor with correct prediction length
+        current_estimator = load_estimator()
+        if current_estimator is None:
+            return jsonify({"error": "Failed to load estimator"}), 500
+        
+        # Create predictor with correct prediction length
+        current_predictor = create_predictor_for_length(prediction_length)
         if current_predictor is None:
-            return jsonify({"error": "Failed to load model"}), 500
+            return jsonify({"error": "Failed to create predictor"}), 500
         
         # Prepare timestamps
         if timestamps:
@@ -240,8 +293,7 @@ def predict():
         
         log_message("Created dataset, starting prediction...")
         
-        # Update predictor's prediction length
-        current_predictor.prediction_length = prediction_length
+        # No need to update prediction length - predictor was created with correct length
         
         # Make prediction
         forecast_it, ts_it = make_evaluation_predictions(
@@ -260,20 +312,28 @@ def predict():
         
         log_message("Prediction completed, processing results...")
         
-        # Extract predictions (mean forecast)
+        # Extract predictions (mean forecast) - no slicing needed since predictor was created with correct length
         predictions = forecast.mean.tolist()
         
-        # Extract confidence intervals (quantiles)
+        # Extract confidence intervals (quantiles) - no slicing needed
         quantiles = {}
         for q in [0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9]:
             quantiles[f"q{int(q*100)}"] = forecast.quantile(q).tolist()
         
-        # Generate future timestamps
-        future_timestamps = pd.date_range(
+        # Generate future timestamps - continue from last input timestamp
+        # Calculate the last input timestamp using date_range
+        input_timestamps = pd.date_range(
             start=start_timestamp,
-            periods=len(time_series) + prediction_length,
+            periods=len(time_series),
             freq=frequency
-        )[-prediction_length:]  # Get only the future timestamps
+        )
+        last_input_timestamp = input_timestamps[-1]
+        # Generate future timestamps starting from next timestamp after last input
+        future_timestamps = pd.date_range(
+            start=last_input_timestamp,
+            periods=prediction_length + 1,
+            freq=frequency
+        )[1:]  # Exclude the last input timestamp, get only future ones
         
         # Prepare response
         response = {
@@ -346,10 +406,15 @@ def batch_predict():
         
         log_message(f"Processing batch of {len(datasets)} time series")
         
-        # Load model if not already loaded
-        current_predictor = load_model()
+        # Load estimator if not already loaded
+        current_estimator = load_estimator()
+        if current_estimator is None:
+            return jsonify({"error": "Failed to load estimator"}), 500
+        
+        # Create predictor with correct prediction length
+        current_predictor = create_predictor_for_length(prediction_length)
         if current_predictor is None:
-            return jsonify({"error": "Failed to load model"}), 500
+            return jsonify({"error": "Failed to create predictor"}), 500
         
         results = {}
         errors = {}
@@ -397,8 +462,7 @@ def batch_predict():
                 
                 dataset_obj = ListDataset(series_data_dict, freq=frequency)
                 
-                # Update predictor
-                current_predictor.prediction_length = prediction_length
+                # No need to update predictor - it was created with correct prediction length
                 
                 # Make prediction
                 forecast_it, ts_it = make_evaluation_predictions(
@@ -414,20 +478,28 @@ def batch_predict():
                 
                 forecast = forecasts[0]
                 
-                # Extract results
+                # Extract results - no slicing needed since predictor was created with correct length
                 predictions = forecast.mean.tolist()
                 
-                # Extract quantiles
+                # Extract quantiles - no slicing needed
                 quantiles = {}
                 for q in [0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9]:
                     quantiles[f"q{int(q*100)}"] = forecast.quantile(q).tolist()
                 
-                # Generate future timestamps
-                future_timestamps = pd.date_range(
+                # Generate future timestamps - continue from last input timestamp
+                # Calculate the last input timestamp using date_range
+                input_timestamps = pd.date_range(
                     start=start_timestamp,
-                    periods=len(series_data) + prediction_length,
+                    periods=len(series_data),
                     freq=frequency
-                )[-prediction_length:]
+                )
+                last_input_timestamp = input_timestamps[-1]
+                # Generate future timestamps starting from next timestamp after last input
+                future_timestamps = pd.date_range(
+                    start=last_input_timestamp,
+                    periods=prediction_length + 1,
+                    freq=frequency
+                )[1:]  # Exclude the last input timestamp, get only future ones
                 
                 results[series_name] = {
                     "success": True,
@@ -480,7 +552,7 @@ def root():
             "predict": "POST /predict", 
             "batch_predict": "POST /batch_predict"
         },
-        "model_status": "loaded" if predictor is not None else "not_loaded",
+        "model_status": "loaded" if estimator is not None else "not_loaded",
         "documentation": "Check API_SETUP.md for usage examples",
         "note": "Real Lag-Llama foundation model for time series forecasting"
     })
@@ -489,8 +561,8 @@ if __name__ == '__main__':
     print("🚀 Starting Lag-Llama API Server...")
     print("📥 Loading model on startup (this may take a few minutes)...")
     
-    # Pre-load model to avoid cold start delay
-    load_model()
+    # Pre-load estimator to avoid cold start delay
+    load_estimator()
     
     print("🌐 API Server ready!")
     print("📋 Available endpoints:")
